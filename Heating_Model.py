@@ -56,7 +56,7 @@ x_steam = 1.0           # quality (1 = dry saturated vapor)
 mdot_CO2_des = 0.0147   # kg/s
 Q_des_J_per_kgCO2 = 1770e3  # J/kg_CO2 (extra heat sink)
 
-dt = 1.0  # s
+dt = 0.01  # s
 t_end = 700.0  # s (adjust as you like)
 
 # Initial conditions
@@ -119,6 +119,116 @@ def molar_enthalpies_J_per_mol(T_K: float):
     h_h2o = h_g_sat_J_per_kg(T_K) * M_H2O
     return h_air, h_h2o, h_co2
 
+def apply_pressure_and_condensation(
+    T_K: float,
+    n_air_star: float,
+    n_h2o_star: float,
+    n_co2_star: float,
+    venting_now: bool,
+    limit_condensation: bool,
+    m_cond_available: float,
+):
+    """
+    Implements user-requested step order:
+    1) Mass already added (n_*_star inputs).
+    2) Check pressure (decide n_out if venting is active).
+    3) Condensation to keep steam saturated, with optional cap for desorption-only latent heat.
+    4) Venting/outflow enthalpy removal at T_K.
+    """
+    p_sat = p_sat_water_Pa(T_K)
+    n_h2o_eq = p_sat * V_ch / (R * T_K)
+    h_fg = h_fg_water_J_per_kg(T_K)
+    h_f_liq = h_f_liquid_J_per_kg(T_K)
+
+    dm_cond_potential = max(0.0, (n_h2o_star - n_h2o_eq) * M_H2O)
+    if limit_condensation:
+        dm_cond_cap = max(0.0, qdot_des_const * dt / max(h_fg, 1e-9))
+        dm_cond = min(dm_cond_potential, dm_cond_cap)
+    else:
+        dm_cond = dm_cond_potential
+
+    n_h2o_gas = n_h2o_star - dm_cond / M_H2O
+    n_air_pre = n_air_star
+    n_co2_pre = n_co2_star
+    n_tot_pre = n_air_pre + n_h2o_gas + n_co2_pre
+
+    if n_tot_pre > 0.0:
+        y_air = n_air_pre / n_tot_pre
+        y_h2o = n_h2o_gas / n_tot_pre
+        y_co2 = n_co2_pre / n_tot_pre
+    else:
+        y_air = y_h2o = y_co2 = 0.0
+
+    if venting_now:
+        p_limit = max(p_set, p_sat)
+        n_tot_set = p_limit * V_ch / (R * T_K)
+        n_out_total = max(0.0, n_tot_pre - n_tot_set)
+    else:
+        n_tot_set = n_tot_pre
+        n_out_total = 0.0
+
+    # Target steam removal needed to stay exactly at saturation after limited condensation
+    n_h2o_out_target = max(0.0, n_h2o_gas - n_h2o_eq)
+    if not limit_condensation:
+        n_h2o_out = y_h2o * n_out_total
+    else:
+        n_h2o_out = min(n_h2o_out_target, n_out_total)
+
+    n_h2o_out = min(n_h2o_out, n_h2o_gas)
+    n_other_out = max(0.0, n_out_total - n_h2o_out)
+    other_total = n_air_pre + n_co2_pre
+    if other_total > 0.0:
+        frac_air = n_air_pre / other_total
+        n_air_out = frac_air * n_other_out
+        n_co2_out = n_other_out - n_air_out
+    else:
+        n_air_out = 0.0
+        n_co2_out = 0.0
+
+    n_h2o_after = n_h2o_gas - n_h2o_out
+    deficit_moles = max(0.0, n_h2o_eq - n_h2o_after)
+    available_evap_mass = max(0.0, m_cond_available + dm_cond)
+    evap_mass = min(deficit_moles * M_H2O, available_evap_mass)
+
+    dm_cond_net = dm_cond - evap_mass
+    n_h2o_after += evap_mass / M_H2O
+
+    h_air_mol, h_h2o_mol, h_co2_mol = molar_enthalpies_J_per_mol(T_K)
+    dH_out = (
+        n_air_out * h_air_mol
+        + n_h2o_out * h_h2o_mol
+        + n_co2_out * h_co2_mol
+    )
+    dH_cond = dm_cond_net * h_fg
+    if limit_condensation:
+        dH_cond_to_cp = 0.0
+    else:
+        dH_cond_to_cp = dH_cond
+    dH_liq = dm_cond_net * h_f_liq
+
+    n_air_after = n_air_pre - n_air_out
+    n_co2_after = n_co2_pre - n_co2_out
+
+    return {
+        "p_sat": p_sat,
+        "n_h2o_eq": n_h2o_eq,
+        "dm_cond": dm_cond_net,
+        "dH_cond": dH_cond,
+        "dH_cond_to_cp": dH_cond_to_cp,
+        "dH_liq": dH_liq,
+        "n_out": n_out_total,
+        "n_air_out": n_air_out,
+        "n_h2o_out": n_h2o_out,
+        "n_co2_out": n_co2_out,
+        "n_air_after": n_air_after,
+        "n_h2o_after": n_h2o_after,
+        "n_co2_after": n_co2_after,
+        "dH_out": dH_out,
+        "y_air": y_air,
+        "y_h2o": y_h2o,
+        "y_co2": y_co2,
+    }
+
 T_steam_in_K = T_steam_in_C + 273.15
 h_in_steam = x_steam * h_g_sat_J_per_kg(T_steam_in_K) + (1.0 - x_steam) * h_f_liquid_J_per_kg(T_steam_in_K)
 qdot_steam_in_const = mdot_steam_in * h_in_steam  # W
@@ -167,12 +277,14 @@ qdot_steam_in = np.full(N, qdot_steam_in_const)
 qdot_des = np.full(N, qdot_des_const)
 qdot_ext_series = np.full(N, Qdot_ext)
 qdot_cond = np.zeros(N)
+qdot_cond_liq = np.zeros(N)
 qdot_out = np.zeros(N)
 qdot_heating_chamber = np.zeros(N)
 qdot_balance_res = np.zeros(N)
 
-# Phase flag
+# Phase flags
 venting_active = False
+temp_limit_reached = False
 
 # -----------------------------
 # 5) Time stepping
@@ -216,146 +328,100 @@ for k in range(N):
     dH_in = qdot_steam_in_const * dt  # J
     dQ_des = qdot_des_const * dt  # J
 
-    # ---- Solve for T_next with fixed-point iteration (handles condensation + venting coupling)
+    # ---- Solve for T_next with fixed-point iteration (requested step order)
     T_guess = T_prev
     for _ in range(80):
-        # Condensation equilibrium at T_guess
-        p_sat = p_sat_water_Pa(T_guess)
-        n_h2o_eq = p_sat * V_ch / (R * T_guess)
-        n_h2o_gas = min(n_h2o_star, n_h2o_eq)
+        limit_cond_now = temp_limit_reached or (T_guess >= T_steam_in_K - 1e-6)
+        step_state = apply_pressure_and_condensation(
+            T_guess,
+            n_air_star,
+            n_h2o_star,
+            n_co2_star,
+            venting_active,
+            limit_cond_now,
+            m_cond_liq,
+        )
 
-        dm_cond_step = max(0.0, (n_h2o_star - n_h2o_gas) * M_H2O)  # kg in this step
-        dH_cond = dm_cond_step * h_fg_water_J_per_kg(T_guess)       # J released
-
-        # Pre-vent moles after condensation
-        n_air_pre = n_air_star
-        n_h2o_pre = n_h2o_gas
-        n_co2_pre = n_co2_star
-        n_tot_pre = n_air_pre + n_h2o_pre + n_co2_pre
-
-        # Venting required to meet set pressure (if active)
-        if venting_active:
-            p_limit_iter = max(p_set, p_sat)
-            n_tot_set = p_limit_iter * V_ch / (R * T_guess)
-            n_out = max(0.0, n_tot_pre - n_tot_set)
-        else:
-            n_out = 0.0
-
-        if n_tot_pre > 0.0:
-            y_air = n_air_pre / n_tot_pre
-            y_h2o = n_h2o_pre / n_tot_pre
-            y_co2 = n_co2_pre / n_tot_pre
-        else:
-            y_air = y_h2o = y_co2 = 0.0
-
-        if n_tot_pre > 0.0:
-            n_air_out_iter = y_air * n_out
-            n_h2o_out_iter = y_h2o * n_out
-            n_co2_out_iter = y_co2 * n_out
-            h_air_mol, h_h2o_mol, h_co2_mol = molar_enthalpies_J_per_mol(T_guess)
-            dH_out = (
-                n_air_out_iter * h_air_mol
-                + n_h2o_out_iter * h_h2o_mol
-                + n_co2_out_iter * h_co2_mol
-            )
-        else:
-            dH_out = 0.0
-
-        # Energy balance on lumped thermal mass (dominant cp)
-        dE = (Qdot_ext * dt) - dQ_des + dH_in - dH_out
+        dE = (
+            (Qdot_ext * dt)
+            - dQ_des
+            + dH_in
+            + step_state["dH_cond_to_cp"]
+            - step_state["dH_out"]
+            - step_state["dH_liq"]
+        )
         T_new = T_prev + dE / C_cp
         T_new = min(T_new, T_steam_in_K)
 
         if abs(T_new - T_guess) < 1e-5:
             T_guess = T_new
             break
-        # Under-relaxation for stability
-        T_guess = 0.5 * T_guess + 0.5 * T_new
+        T_guess = 0.5 * (T_guess + T_new)
 
     T_next = min(T_guess, T_steam_in_K)
 
     # ---- Finalize step with converged T_next
-    p_sat = p_sat_water_Pa(T_next)
-    n_h2o_eq = p_sat * V_ch / (R * T_next)
-    n_h2o_gas = min(n_h2o_star, n_h2o_eq)
+    limit_cond_final = temp_limit_reached or (T_next >= T_steam_in_K - 1e-6)
+    final_state = apply_pressure_and_condensation(
+        T_next,
+        n_air_star,
+        n_h2o_star,
+        n_co2_star,
+        venting_active,
+        limit_cond_final,
+        m_cond_liq,
+    )
 
-    dm_cond_step = max(0.0, (n_h2o_star - n_h2o_gas) * M_H2O)
-    dH_cond_final = dm_cond_step * h_fg_water_J_per_kg(T_next)
+    p_sat = final_state["p_sat"]
+    n_h2o_eq = final_state["n_h2o_eq"]
+    dm_cond_step = final_state["dm_cond"]
+    dH_cond_final = final_state["dH_cond_to_cp"]
+    dH_liq_final = final_state["dH_liq"]
     m_cond_liq += dm_cond_step
     mdot_cond_step = dm_cond_step
     qdot_cond[k + 1] = dH_cond_final / dt
+    qdot_cond_liq[k + 1] = dH_liq_final / dt
+    qdot_out[k + 1] = final_state["dH_out"] / dt
 
-    n_air_pre = n_air_star
-    n_h2o_pre = n_h2o_gas
-    n_co2_pre = n_co2_star
-    n_tot_pre = n_air_pre + n_h2o_pre + n_co2_pre
+    n_air = final_state["n_air_after"]
+    n_h2o = final_state["n_h2o_after"]
+    n_co2 = final_state["n_co2_after"]
 
-    if venting_active:
-        p_limit_final = max(p_set, p_sat)
-        n_tot_set = p_limit_final * V_ch / (R * T_next)
-        n_out = max(0.0, n_tot_pre - n_tot_set)
-    else:
-        n_out = 0.0
+    n_out = final_state["n_out"]
+    n_air_out = final_state["n_air_out"]
+    n_h2o_out = final_state["n_h2o_out"]
+    n_co2_out = final_state["n_co2_out"]
+    y_air = final_state["y_air"]
+    y_h2o = final_state["y_h2o"]
+    y_co2 = final_state["y_co2"]
 
-    if n_tot_pre > 0.0:
-        y_air = n_air_pre / n_tot_pre
-        y_h2o = n_h2o_pre / n_tot_pre
-        y_co2 = n_co2_pre / n_tot_pre
-    else:
-        y_air = y_h2o = y_co2 = 0.0
-
-    n_air_out = y_air * n_out
-    n_h2o_out = y_h2o * n_out
-    n_co2_out = y_co2 * n_out
-    h_air_mol, h_h2o_mol, h_co2_mol = molar_enthalpies_J_per_mol(T_next)
-    dH_out_final = (
-        n_air_out * h_air_mol
-        + n_h2o_out * h_h2o_mol
-        + n_co2_out * h_co2_mol
-    )
-    qdot_out[k + 1] = dH_out_final / dt
-
-    # Update moles after vent
-    n_air = n_air_pre - n_air_out
-    n_h2o = n_h2o_pre - n_h2o_out
-    n_co2 = n_co2_pre - n_co2_out
-
-    # Ensure chamber vapor stays saturated by re-evaporating condensate if needed
-    n_h2o_deficit = max(0.0, n_h2o_eq - n_h2o)
-    if n_h2o_deficit > 0.0:
-        available_moles = m_cond_liq / M_H2O
-        delta_evap = min(n_h2o_deficit, available_moles)
-        if delta_evap > 0.0:
-            n_h2o += delta_evap
-            evap_mass = delta_evap * M_H2O
-            m_cond_liq -= evap_mass
-            latent_evap = evap_mass * h_fg_water_J_per_kg(T_next)
-            qdot_cond[k + 1] -= latent_evap / dt
-            mdot_cond[k + 1] = (mdot_cond_step - evap_mass) / dt
-        else:
-            mdot_cond[k + 1] = mdot_cond_step / dt
-    else:
-        mdot_cond[k + 1] = mdot_cond_step / dt
+    mdot_cond[k + 1] = dm_cond_step / dt
 
     # Outflow mass rates (kg/s)
-    mdot_out_tot[k + 1] = (n_out * (y_air * M_air + y_h2o * M_H2O + y_co2 * M_CO2)) / dt
     mdot_out_air[k + 1] = (n_air_out * M_air) / dt
     mdot_out_h2o[k + 1] = (n_h2o_out * M_H2O) / dt
     mdot_out_steam[k + 1] = mdot_out_h2o[k + 1]
     mdot_out_co2[k + 1] = (n_co2_out * M_CO2) / dt
+    mdot_out_tot[k + 1] = (
+        mdot_out_air[k + 1] + mdot_out_h2o[k + 1] + mdot_out_co2[k + 1]
+    )
 
     # Update energy storage term (lumped thermal mass)
     qdot_heating_chamber[k + 1] = C_cp * (T_next - T_prev) / dt
     qdot_balance_res[k + 1] = (
         qdot_ext_series[k + 1]
         + qdot_steam_in[k + 1]
+        + qdot_cond[k + 1]
         - qdot_des[k + 1]
         - qdot_out[k + 1]
+        - qdot_cond_liq[k + 1]
         - qdot_heating_chamber[k + 1]
     )
 
     # Update temperature
     T_prev = T_next
+    if (not temp_limit_reached) and (T_prev >= T_steam_in_K - 1e-6):
+        temp_limit_reached = True
 
 # -----------------------------
 # 6) Plotting
