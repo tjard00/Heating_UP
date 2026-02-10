@@ -38,7 +38,7 @@ cp_m_air = 29.1
 cp_m_CO2 = 37.1
 cp_m_H2O = 33.6  # water vapor
 
-T_ref_K = 273.15  # reference for sensible enthalpy (0°C)
+T_ref_K = 273.15  # reference for sensible enthalpy (0Â°C)
 
 # -----------------------------
 # 1) User parameters (your case)
@@ -49,8 +49,8 @@ m_cp = 2010.0  # kg
 cp_cp = 850.0  # J/kg/K
 C_cp = m_cp * cp_cp  # J/K (dominant thermal mass)
 
-mdot_steam_in = 0.1212  # kg/s
-T_steam_in_C = 85.0     # °C
+mdot_steam_in = 0.1012  # kg/s
+T_steam_in_C = 85.0     # Â°C
 x_steam = 1.0           # quality (1 = dry saturated vapor)
 
 mdot_CO2_des = 0.0147   # kg/s
@@ -79,7 +79,7 @@ Qdot_ext = 0.0  # W (set if you have external heating)
 def p_sat_water_Pa(T_K: float) -> float:
     """
     Saturation vapor pressure of water (Pa).
-    Magnus-Tetens (good for ~0..100°C).
+    Magnus-Tetens (good for ~0..100Â°C).
     """
     T_C = T_K - 273.15
     # over liquid water:
@@ -87,23 +87,23 @@ def p_sat_water_Pa(T_K: float) -> float:
 
 def h_fg_water_J_per_kg(T_K: float) -> float:
     """
-    Approx latent heat of vaporization of water (J/kg) for ~0..100°C.
-    Linear-ish correlation: h_fg(kJ/kg) ~ 2500.9 - 2.381*T(°C)
+    Approx latent heat of vaporization of water (J/kg) for ~0..100Â°C.
+    Linear-ish correlation: h_fg(kJ/kg) ~ 2500.9 - 2.381*T(Â°C)
     """
     T_C = T_K - 273.15
     return (2500.9 - 2.381 * T_C) * 1000.0
 
 def h_f_liquid_J_per_kg(T_K: float) -> float:
     """
-    Approx liquid water enthalpy relative to 0°C (J/kg).
-    h_f ~ cp_l * (T - 0°C). cp_l ~ 4.186 kJ/kg/K
+    Approx liquid water enthalpy relative to 0Â°C (J/kg).
+    h_f ~ cp_l * (T - 0Â°C). cp_l ~ 4.186 kJ/kg/K
     """
     cp_l = 4186.0  # J/kg/K
     return cp_l * (T_K - 273.15)
 
 def h_g_sat_J_per_kg(T_K: float) -> float:
     """
-    Approx saturated vapor enthalpy (J/kg) at T, relative to 0°C baseline:
+    Approx saturated vapor enthalpy (J/kg) at T, relative to 0Â°C baseline:
     h_g = h_f + h_fg.
     """
     return h_f_liquid_J_per_kg(T_K) + h_fg_water_J_per_kg(T_K)
@@ -194,11 +194,10 @@ def apply_pressure_and_condensation(
     n_h2o_after += evap_mass / M_H2O
 
     h_air_mol, h_h2o_mol, h_co2_mol = molar_enthalpies_J_per_mol(T_K)
-    dH_out = (
-        n_air_out * h_air_mol
-        + n_h2o_out * h_h2o_mol
-        + n_co2_out * h_co2_mol
-    )
+    dH_out_air = n_air_out * h_air_mol
+    dH_out_h2o = n_h2o_out * h_h2o_mol
+    dH_out_co2 = n_co2_out * h_co2_mol
+    dH_out = dH_out_air + dH_out_h2o + dH_out_co2
     dH_cond = dm_cond_net * h_fg
     if limit_condensation:
         dH_cond_to_cp = 0.0
@@ -224,6 +223,9 @@ def apply_pressure_and_condensation(
         "n_h2o_after": n_h2o_after,
         "n_co2_after": n_co2_after,
         "dH_out": dH_out,
+        "dH_out_air": dH_out_air,
+        "dH_out_h2o": dH_out_h2o,
+        "dH_out_co2": dH_out_co2,
         "y_air": y_air,
         "y_h2o": y_h2o,
         "y_co2": y_co2,
@@ -279,6 +281,9 @@ qdot_ext_series = np.full(N, Qdot_ext)
 qdot_cond = np.zeros(N)
 qdot_cond_liq = np.zeros(N)
 qdot_out = np.zeros(N)
+qdot_out_steam = np.zeros(N)
+qdot_out_co2 = np.zeros(N)
+qdot_storage_chamber = np.zeros(N)
 qdot_heating_chamber = np.zeros(N)
 qdot_balance_res = np.zeros(N)
 
@@ -342,14 +347,15 @@ for k in range(N):
             m_cond_liq,
         )
 
-        dE = (
-            (Qdot_ext * dt)
-            - dQ_des
-            + dH_in
-            + step_state["dH_cond_to_cp"]
-            - step_state["dH_out"]
-            - step_state["dH_liq"]
+        qdot_out_h2o_iter = step_state["dH_out_h2o"] / dt
+        qdot_out_co2_iter = step_state["dH_out_co2"] / dt
+        qdot_heating_iter = (
+            qdot_steam_in_const
+            - qdot_des_const
+            - qdot_out_h2o_iter
+            - qdot_out_co2_iter
         )
+        dE = (Qdot_ext * dt) + qdot_heating_iter * dt
         T_new = T_prev + dE / C_cp
         T_new = min(T_new, T_steam_in_K)
 
@@ -382,6 +388,8 @@ for k in range(N):
     qdot_cond[k + 1] = dH_cond_final / dt
     qdot_cond_liq[k + 1] = dH_liq_final / dt
     qdot_out[k + 1] = final_state["dH_out"] / dt
+    qdot_out_steam[k + 1] = final_state["dH_out_h2o"] / dt
+    qdot_out_co2[k + 1] = final_state["dH_out_co2"] / dt
 
     n_air = final_state["n_air_after"]
     n_h2o = final_state["n_h2o_after"]
@@ -406,16 +414,18 @@ for k in range(N):
         mdot_out_air[k + 1] + mdot_out_h2o[k + 1] + mdot_out_co2[k + 1]
     )
 
-    # Update energy storage term (lumped thermal mass)
-    qdot_heating_chamber[k + 1] = C_cp * (T_next - T_prev) / dt
+    # Update energy storage term (lumped thermal mass) and effective heating signal
+    qdot_storage_chamber[k + 1] = C_cp * (T_next - T_prev) / dt
+    qdot_heating_chamber[k + 1] = (
+        qdot_steam_in[k + 1]
+        - qdot_des[k + 1]
+        - qdot_out_steam[k + 1]
+        - qdot_out_co2[k + 1]
+    )
     qdot_balance_res[k + 1] = (
         qdot_ext_series[k + 1]
-        + qdot_steam_in[k + 1]
-        + qdot_cond[k + 1]
-        - qdot_des[k + 1]
-        - qdot_out[k + 1]
-        - qdot_cond_liq[k + 1]
-        - qdot_heating_chamber[k + 1]
+        + qdot_heating_chamber[k + 1]
+        - qdot_storage_chamber[k + 1]
     )
 
     # Update temperature
@@ -436,91 +446,67 @@ p_sat_chamber_mbar = p_sat_chamber / 100.0
 p_sat_in_mbar = np.full(N, p_sat_in_Pa / 100.0)
 phi_plot = np.clip(phi_rel, 0.0, 1.2)
 
-# (1) Total + partial pressures
-plt.figure()
-plt.plot(t, p_mbar, label="p_total [mbar]")
-plt.plot(t, p_air_mbar, label="p_air [mbar]")
-plt.plot(t, p_h2o_mbar, label="p_H2O [mbar]")
-plt.plot(t, p_co2_mbar, label="p_CO2 [mbar]")
-plt.axhline(p_set_mbar, linestyle="--", label="p_set [mbar]")
-plt.xlabel("time [s]")
-plt.ylabel("pressure [mbar]")
-plt.legend()
-plt.tight_layout()
-
-# (2) Temperature
-plt.figure()
-plt.plot(t, T_C, label="T_chamber [°C]")
-plt.axhline(T_steam_in_C, linestyle="--", label="T_steam_in [°C]")
-plt.xlabel("time [s]")
-plt.ylabel("temperature [°C]")
-plt.legend()
-plt.tight_layout()
-
-# (3) Steam saturation in vs. out
-plt.figure()
-plt.plot(t, p_sat_chamber_mbar, label="p_sat_out (chamber) [mbar]")
-plt.plot(t, p_sat_in_mbar, linestyle="--", label="p_sat_in (inlet steam) [mbar]")
-plt.plot(t, p_h2o_mbar, label="p_H2O actual [mbar]")
-plt.xlabel("time [s]")
-plt.ylabel("pressure [mbar]")
-plt.legend()
-plt.tight_layout()
-
-# (4) Steam saturation ratio φ = p_H2O / p_sat
-plt.figure()
-plt.plot(t, phi_plot, label="φ(t)")
-plt.axhline(1.0, color="k", linestyle="--", label="φ = 1")
-plt.xlabel("time [s]")
-plt.ylabel("saturation ratio [-]")
-plt.legend()
-plt.tight_layout()
-
-# (5) Mass flow rates in / condensed / out (total)
-plt.figure()
-plt.plot(t, mdot_in_steam, label="mdot_steam_in [kg/s]")
-plt.plot(t, mdot_in_co2, label="mdot_CO2_des [kg/s]")
-plt.plot(t, mdot_cond, label="mdot_condensed [kg/s]")
-plt.plot(t, mdot_out_tot, label="mdot_out_total [kg/s]")
-plt.plot(t, mdot_out_steam, label="mdot_steam_out [kg/s]")
-plt.xlabel("time [s]")
-plt.ylabel("mass flow [kg/s]")
-plt.legend()
-plt.tight_layout()
-
-# (6) Outflow split by components
-plt.figure()
-plt.plot(t, mdot_out_air, label="mdot_out_air [kg/s]")
-plt.plot(t, mdot_out_h2o, label="mdot_out_H2O [kg/s]")
-plt.plot(t, mdot_out_co2, label="mdot_out_CO2 [kg/s]")
-plt.xlabel("time [s]")
-plt.ylabel("mass flow out [kg/s]")
-plt.legend()
-plt.tight_layout()
-
-# (7) Energy balance rates
-plt.figure()
-plt.plot(t, qdot_steam_in, label="Qdot_steam_in [W]")
-plt.plot(t, qdot_ext_series, label="Qdot_ext [W]")
-plt.plot(t, qdot_cond, label="Qdot_cond (internal) [W]")
-plt.plot(t, -qdot_des, label="Qdot_des (loss) [W]")
-plt.plot(t, -qdot_out, label="Qdot_out (vent loss) [W]")
-plt.plot(t, qdot_heating_chamber, label="Qdot_heating_chamber [W]")
-plt.plot(t, qdot_balance_res, linestyle="--", label="Balance residual [W]")
-plt.xlabel("time [s]")
-plt.ylabel("energy rate [W]")
-plt.legend()
-plt.tight_layout()
-
-# (8) Internal energy of chamber (relative to initial state)
-plt.figure()
 U_chamber = C_cp * (T - T[0])  # J
-plt.plot(t, U_chamber / 1e6)
-plt.xlabel("time [s]")
-plt.ylabel("chamber internal energy [MJ]")
-plt.title("Internal Energy Stored in Chamber")
-plt.tight_layout()
 
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+
+ax = axes[0][0]
+ax.plot(t, p_mbar, label='p_total')
+ax.plot(t, p_air_mbar, label='p_air')
+ax.plot(t, p_h2o_mbar, label='p_H2O')
+ax.plot(t, p_co2_mbar, label='p_CO2')
+ax.axhline(p_set_mbar, linestyle='--', label='p_set')
+ax.set_ylabel('pressure [mbar]')
+ax.set_title('Total & Partial Pressures')
+ax.legend(fontsize='small')
+
+ax = axes[0][1]
+ax.plot(t, T_C, label='T_chamber')
+ax.axhline(T_steam_in_C, linestyle='--', label='T_steam_in')
+ax2 = ax.twinx()
+ax2.plot(t, phi_plot, color='tab:red', label='phi(t)')
+ax.axhline(1.0, color='gray', linestyle=':', linewidth=1)
+ax.set_ylabel('temperature [°C]')
+ax2.set_ylabel('phi [-]', color='tab:red')
+ax.set_title('Temperature & Saturation')
+lines, labels = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines + lines2, labels + labels2, fontsize='small', loc='lower right')
+
+ax = axes[1][0]
+ax.plot(t, mdot_in_steam, label='mdot_steam_in')
+ax.plot(t, mdot_in_co2, label='mdot_CO2_des')
+ax.plot(t, mdot_cond, label='mdot_condensed')
+ax.plot(t, mdot_out_tot, label='mdot_out_total')
+ax.plot(t, mdot_out_steam, label='mdot_steam_out')
+ax.plot(t, mdot_out_air, linestyle='--', label='mdot_out_air')
+ax.plot(t, mdot_out_co2, linestyle='--', label='mdot_out_CO2')
+ax.set_xlabel('time [s]')
+ax.set_ylabel('mass flow [kg/s]')
+ax.set_title('Mass Flows')
+ax.legend(fontsize='small', ncol=2)
+
+ax = axes[1][1]
+ax.plot(t, qdot_steam_in, label='Qdot_steam_in')
+ax.plot(t, qdot_ext_series, label='Qdot_ext')
+ax.plot(t, qdot_cond, label='Qdot_cond (cp)')
+ax.plot(t, qdot_cond_liq, label='Qdot_cond_liq')
+ax.plot(t, -qdot_des, label='Qdot_des')
+ax.plot(t, -qdot_out, label='Qdot_out')
+ax.plot(t, qdot_heating_chamber, label='Qdot_heating')
+ax.plot(t, qdot_storage_chamber, label='Qdot_storage (cp)')
+ax.plot(t, qdot_balance_res, linestyle='--', label='Residual')
+ax2 = ax.twinx()
+ax2.plot(t, U_chamber / 1e6, color='tab:gray', label='U_chamber')
+ax2.set_ylabel('U [MJ]', color='tab:gray')
+ax.set_xlabel('time [s]')
+ax.set_ylabel('energy rate [W]')
+ax.set_title('Energy & Storage')
+lines, labels = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines + lines2, labels + labels2, fontsize='small', ncol=2, loc='upper right')
+
+fig.tight_layout()
 plt.show()
 
 # -----------------------------
@@ -529,13 +515,13 @@ plt.show()
 # Time when pressure first reaches setpoint
 idx_set = np.argmax(p_mbar >= p_set_mbar)
 if p_mbar[idx_set] >= p_set_mbar:
-    print(f"p_set reached at t = {t[idx_set]:.1f} s, T = {T_C[idx_set]:.2f} °C, p = {p_mbar[idx_set]:.2f} mbar")
+    print(f"p_set reached at t = {t[idx_set]:.1f} s, T = {T_C[idx_set]:.2f} Â°C, p = {p_mbar[idx_set]:.2f} mbar")
 else:
     print("p_set not reached within simulated time.")
 
-# Time when temperature reaches 85°C (if it does)
+# Time when temperature reaches 85Â°C (if it does)
 idx_85 = np.argmax(T_C >= 85.0)
 if T_C[idx_85] >= 85.0:
-    print(f"T reaches 85°C at t = {t[idx_85]:.1f} s, p = {p_mbar[idx_85]:.2f} mbar")
+    print(f"T reaches 85Â°C at t = {t[idx_85]:.1f} s, p = {p_mbar[idx_85]:.2f} mbar")
 else:
-    print("85°C not reached within simulated time.")
+    print("85Â°C not reached within simulated time.")
