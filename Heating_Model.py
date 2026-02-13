@@ -1,24 +1,32 @@
 """
-Chamber model with:
-- closed outlet until total pressure reaches p_set
-- then "ideal" venting to keep total pressure at p_set (vent to lower backpressure)
-- humid air initially (given RH)
-- steam inflow (quality x=1, assumed saturated vapor at T_steam_in_C)
-- constant CO2 desorption mass source with additional heat sink Q_des (J/kg_CO2)
-- water vapor can condense to liquid to satisfy saturation: p_H2O <= p_sat(T)
+Chamber energy + mass balance model
+-----------------------------------
 
-Outputs (time series):
-- total pressure and partial pressures (air, H2O, CO2)
-- temperature
-- mass flow rates: in (steam, CO2), condensed, out (total + components)
+Main features:
+    1. Closed reactor of volume ``V_ch`` with humid air initially. Outlet
+       valve stays shut until the compounded pressure reaches ``p_set``,
+       afterwards venting keeps the chamber at ``max(p_set, p_sat)``
+       (i.e. constant pressure unless the chamber is fully saturated).
+    2. Steam inflow is fully saturated vapor at ``T_steam_in_C`` with quality
+       ``x_steam``. CO2 desorbs at a fixed mass rate and extracts an extra heat
+       load ``Q_des`` per kg CO2.
+    3. Water vapor can condense to maintain ``p_H2O ≤ p_sat(T)``. After the
+       temperature hits the steam inlet temperature the condensation rate is
+       limited so that only the desorption heat demand is covered
+       (``ṁ_cond = Q̇_des / h_fg``). Surplus steam is vented directly.
+    4. Energy balance uses a single lumped ``C_cp`` for the entire chamber.
+       ``ΔT`` is solved from the net heating term you requested:
+         ``Q̇_heating = Q̇_steam,in − Q̇_des − Q̇_steam,out − Q̇_CO2,out``.
+       Condensation heat no longer contributes to the cp-mass once the
+       temperature limit is reached.
 
-ASSUMPTIONS (kept simple and explicit):
-- ideal gases, perfectly mixed gas phase
-- one lumped temperature for the whole chamber (dominated by cp-mass heat capacity)
-- no external heat loss to ambient (can be added as Q_dot_loss if needed)
-- steam inflow energy uses saturated-vapor enthalpy at T_steam_in_C (approx correlations)
-- condensation releases latent heat h_fg(T) (approx correlation)
-- vented gas removes sensible enthalpy only (approx constant cp per species)
+Assumptions:
+    - Perfect mixing, ideal gases.
+    - No external heat losses besides the explicitly modelled terms.
+    - Vented gas carries only sensible enthalpy (latent already counted in
+      the condensation term).
+    - Condensed liquid stays in the vessel unless re-evaporated to maintain
+      saturation.
 """
 
 import numpy as np
@@ -131,11 +139,18 @@ def apply_pressure_and_condensation(
     m_cond_available: float,
 ):
     """
-    Implements user-requested step order:
-    1) Mass already added (n_*_star inputs).
-    2) Check pressure (decide n_out if venting is active).
-    3) Condensation to keep steam saturated, with optional cap for desorption-only latent heat.
-    4) Venting/outflow enthalpy removal at T_K.
+    Core mass/enthalpy sub-model applied twice per timestep:
+        Step 1  Add inflow moles (results passed as n_*_star).
+        Step 2  Evaluate pressure limit (vent vs. closed) at the guessed T_K.
+        Step 3  Condensation: first satisfy saturation, then—if limit_condensation
+                is True—cap the condensation mass so that only the CO2-desorption
+                demand is met.
+        Step 4  Venting: bleed off the required total mole surplus while first
+                ejecting steam (so φ stays ≈1) and distributing the remainder
+                between air + CO2. Track the resulting enthalpy removal per species.
+        Step 5  Re-evaporate condensate if necessary to keep the gas at saturation.
+    Returns updated molar inventories plus the enthalpy flows that the main time
+    integrator needs.
     """
     p_sat = p_sat_water_Pa(T_K)
     n_h2o_eq = p_sat * V_ch / (R * T_K)
@@ -356,6 +371,10 @@ for k in range(N):
 
         qdot_out_h2o_iter = step_state["dH_out_h2o"] / dt
         qdot_out_co2_iter = step_state["dH_out_co2"] / dt
+        # Effective heating term = steam enthalpy in minus desorption minus
+        # vented sensible enthalpy of steam + CO2. This is the only heat that
+        # can raise the lumped Cp mass (latent contributions were handled in
+        # qdot_cond already).
         qdot_heating_iter = (
             qdot_steam_in_const
             - qdot_des_const
