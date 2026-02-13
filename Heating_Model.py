@@ -34,6 +34,9 @@ import matplotlib.pyplot as plt
 from CoolProp.CoolProp import PropsSI
 import CoolProp.CoolProp as CP
 from CoolProp.CoolProp import AbstractState
+import pandas as pd
+from pathlib import Path
+import time
 # -----------------------------
 # 0) Constants
 # -----------------------------
@@ -252,7 +255,7 @@ T_steam_in_K = T_steam_in_C + 273.15
 h_in_steam = x_steam * h_g_sat_J_per_kg(T_steam_in_K) + (1.0 - x_steam) * h_f_liquid_J_per_kg(T_steam_in_K)
 qdot_steam_in_const = mdot_steam_in * h_in_steam  # W
 qdot_des_const = mdot_CO2_des * Q_des_J_per_kgCO2  # W
-p_sat_in_Pa = p_sat_water_Pa(T_steam_in_K)
+p_sat_in_Pa = p_steam_in_Pa
 
 # -----------------------------
 # 3) Initialize state from RH
@@ -481,6 +484,59 @@ p_co2_mbar = p_co2 / 100.0
 p_sat_chamber_mbar = p_sat_chamber / 100.0
 p_sat_in_mbar = np.full(N, p_sat_in_Pa / 100.0)
 phi_plot = np.clip(phi_rel, 0.0, 1.2)
+cond_ratio = np.divide(
+    mdot_cond,
+    np.maximum(mdot_in_steam, 1e-9),
+    out=np.zeros_like(mdot_cond),
+    where=mdot_in_steam > 0,
+)
+
+excel_data = {
+    "time_s": t,
+    "T_C": T_C,
+    "p_total_mbar": p_mbar,
+    "p_air_mbar": p_air_mbar,
+    "p_h2o_mbar": p_h2o_mbar,
+    "p_co2_mbar": p_co2_mbar,
+    "p_sat_chamber_mbar": p_sat_chamber / 100.0,
+    "phi_rel": phi_rel,
+    "density_chamber_kg_m3": rho,
+    "mdot_steam_in_kg_s": mdot_in_steam,
+    "mdot_CO2_in_kg_s": mdot_in_co2,
+    "mdot_condensed_kg_s": mdot_cond,
+    "cond_ratio": cond_ratio,
+    "mdot_out_total_kg_s": mdot_out_tot,
+    "mdot_out_air_kg_s": mdot_out_air,
+    "mdot_out_steam_kg_s": mdot_out_steam,
+    "mdot_out_CO2_kg_s": mdot_out_co2,
+    "vdot_out_m3_s": vdot_out,
+    "vdot_out_m3_h": vdot_out * 3600.0,
+    "rho_out_kg_m3": rho_out,
+    "qdot_steam_in_W": qdot_steam_in,
+    "qdot_cond_cp_W": qdot_cond,
+    "qdot_cond_liq_W": qdot_cond_liq,
+    "qdot_des_W": qdot_des,
+    "qdot_out_W": qdot_out,
+    "qdot_out_steam_W": qdot_out_steam,
+    "qdot_out_CO2_W": qdot_out_co2,
+    "qdot_heating_W": qdot_heating_chamber,
+    "qdot_storage_W": qdot_storage_chamber,
+    "qdot_balance_res_W": qdot_balance_res,
+}
+
+df_full = pd.DataFrame(excel_data)
+desired_secs = np.arange(0, int(np.floor(t[-1])) + 1)
+sample_indices = np.clip(np.round(desired_secs / dt).astype(int), 0, N - 1)
+sample_indices = np.unique(sample_indices)
+df_seconds = df_full.iloc[sample_indices].copy()
+df_seconds["time_s"] = np.round(df_seconds["time_s"]).astype(int)
+excel_path = Path("heating_model_timeseries.xlsx")
+if excel_path.exists():
+    try:
+        excel_path.unlink()
+    except PermissionError:
+        excel_path = Path(f"heating_model_timeseries_{int(time.time())}.xlsx")
+df_seconds.to_excel(excel_path, index=False)
 
 U_chamber = C_cp * (T - T[0])  # J
 
