@@ -23,7 +23,9 @@ ASSUMPTIONS (kept simple and explicit):
 
 import numpy as np
 import matplotlib.pyplot as plt
-
+from CoolProp.CoolProp import PropsSI
+import CoolProp.CoolProp as CP
+from CoolProp.CoolProp import AbstractState
 # -----------------------------
 # 0) Constants
 # -----------------------------
@@ -50,9 +52,9 @@ cp_cp = 850.0  # J/kg/K
 C_cp = m_cp * cp_cp  # J/K (dominant thermal mass)
 
 mdot_steam_in = 0.1012  # kg/s
-T_steam_in_C = 85.0     # Â°C
+T_steam_in_C = 88.0     # Â°C
 x_steam = 1.0           # quality (1 = dry saturated vapor)
-
+p_steam_in_Pa = PropsSI('P','T', T_steam_in_C + 273.15,'Q',x_steam,'Water') # Pa (assumed saturated)
 mdot_CO2_des = 0.0147   # kg/s
 Q_des_J_per_kgCO2 = 1770e3  # J/kg_CO2 (extra heat sink)
 
@@ -67,7 +69,7 @@ T1 = T1_C + 273.15  # K
 RH1 = 0.05          # 5% relative humidity (0..1)
 
 # Pressure control
-p_set_mbar = 580.0
+p_set_mbar = p_steam_in_Pa / 100.0  # mbar (set to steam inlet pressure for "just saturated" case)
 p_set = p_set_mbar * 100.0  # Pa
 
 # External heat input (if any)
@@ -263,6 +265,7 @@ p_h2o = np.zeros(N)
 p_co2 = np.zeros(N)
 p_sat_chamber = np.zeros(N)
 phi_rel = np.zeros(N)
+rho = np.zeros(N)
 
 # mass flow signals (kg/s)
 mdot_in_steam = np.full(N, mdot_steam_in)
@@ -274,6 +277,8 @@ mdot_out_air = np.zeros(N)
 mdot_out_h2o = np.zeros(N)
 mdot_out_steam = np.zeros(N)
 mdot_out_co2 = np.zeros(N)
+vdot_out = np.zeros(N)
+rho_out = np.zeros(N)
 
 qdot_steam_in = np.full(N, qdot_steam_in_const)
 qdot_des = np.full(N, qdot_des_const)
@@ -312,6 +317,8 @@ for k in range(N):
     p_co2[k] = p_co2_now
     p_sat_chamber[k] = p_sat_now
     phi_rel[k] = p_h2o_now / max(p_sat_now, 1e-9)
+    mass_now = n_air * M_air + n_h2o * M_H2O + n_co2 * M_CO2
+    rho[k] = mass_now / V_ch
 
     if k == N - 1:
         break
@@ -413,6 +420,16 @@ for k in range(N):
     mdot_out_tot[k + 1] = (
         mdot_out_air[k + 1] + mdot_out_h2o[k + 1] + mdot_out_co2[k + 1]
     )
+    if n_out > 0.0:
+        p_vent = max(p_set, p_sat)
+        vdot = (n_out / dt) * R * T_next / max(p_vent, 1e-9)
+    else:
+        vdot = 0.0
+    vdot_out[k + 1] = vdot
+    if vdot > 0.0:
+        rho_out[k + 1] = mdot_out_tot[k + 1] / vdot
+    else:
+        rho_out[k + 1] = 0.0
 
     # Update energy storage term (lumped thermal mass) and effective heating signal
     qdot_storage_chamber[k + 1] = C_cp * (T_next - T_prev) / dt
@@ -456,6 +473,7 @@ ax.plot(t, p_air_mbar, label='p_air')
 ax.plot(t, p_h2o_mbar, label='p_H2O')
 ax.plot(t, p_co2_mbar, label='p_CO2')
 ax.axhline(p_set_mbar, linestyle='--', label='p_set')
+ax.axhline(p_sat_in_mbar[0], linestyle=':', label='p_steam_in')
 ax.set_ylabel('pressure [mbar]')
 ax.set_title('Total & Partial Pressures')
 ax.legend(fontsize='small')
@@ -465,10 +483,11 @@ ax.plot(t, T_C, label='T_chamber')
 ax.axhline(T_steam_in_C, linestyle='--', label='T_steam_in')
 ax2 = ax.twinx()
 ax2.plot(t, phi_plot, color='tab:red', label='phi(t)')
+ax2.plot(t, np.clip(mdot_cond / np.maximum(mdot_in_steam, 1e-9), 0.0, 2.0), color='tab:green', label='cond/steam')
 ax.axhline(1.0, color='gray', linestyle=':', linewidth=1)
 ax.set_ylabel('temperature [°C]')
-ax2.set_ylabel('phi [-]', color='tab:red')
-ax.set_title('Temperature & Saturation')
+ax2.set_ylabel('φ & ṁcond/ṁsteam [-]', color='tab:red')
+ax.set_title('Temperature, Saturation & Condensation Ratio')
 lines, labels = ax.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 ax.legend(lines + lines2, labels + labels2, fontsize='small', loc='lower right')
@@ -484,7 +503,7 @@ ax.plot(t, mdot_out_co2, linestyle='--', label='mdot_out_CO2')
 ax.set_xlabel('time [s]')
 ax.set_ylabel('mass flow [kg/s]')
 ax.set_title('Mass Flows')
-ax.legend(fontsize='small', ncol=2)
+ax.legend(fontsize='small', ncol=2, loc='upper right')
 
 ax = axes[1][1]
 ax.plot(t, qdot_steam_in, label='Qdot_steam_in')
@@ -507,6 +526,39 @@ lines2, labels2 = ax2.get_legend_handles_labels()
 ax.legend(lines + lines2, labels + labels2, fontsize='small', ncol=2, loc='upper right')
 
 fig.tight_layout()
+plt.show()
+
+fig2, axes2 = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+ax = axes2[0]
+ax.plot(t, vdot_out * 3600.0, label='Vdot_out [m³/h]')
+ax.set_ylabel('volumetric flow [m³/h]')
+ax.set_title('Outlet Volumetric Flow & Density')
+ax_rho_out = ax.twinx()
+ax_rho_out.plot(t, rho_out, color='tab:orange', label='rho_out [kg/m³]')
+ax_rho_out.set_ylabel('rho_out [kg/m³]', color='tab:orange')
+lines, labels = ax.get_legend_handles_labels()
+lines2, labels2 = ax_rho_out.get_legend_handles_labels()
+ax.legend(lines + lines2, labels + labels2, fontsize='small', loc='upper right')
+ax.grid(True, linestyle=':', linewidth=0.5)
+
+ax = axes2[1]
+ax.plot(t, mdot_out_air * 3600.0, label='mdot_out_air')
+ax.plot(t, mdot_out_steam * 3600.0, label='mdot_out_steam')
+ax.plot(t, mdot_out_co2 * 3600.0, label='mdot_out_CO2')
+ax.plot(t, mdot_out_tot * 3600.0, linestyle='--', label='mdot_out_total')
+ax.set_xlabel('time [s]')
+ax.set_ylabel('mass flow out [kg/h]')
+ax.set_title('Outlet Mass Flows & Chamber Temperature')
+ax_T = ax.twinx()
+ax_T.plot(t, T_C, color='tab:red', label='T_chamber')
+ax_T.set_ylabel('temperature [°C]', color='tab:red')
+lines, labels = ax.get_legend_handles_labels()
+lines2, labels2 = ax_T.get_legend_handles_labels()
+ax.legend(lines + lines2, labels + labels2, fontsize='small', loc='upper right')
+ax.grid(True, linestyle=':', linewidth=0.5)
+
+fig2.tight_layout()
 plt.show()
 
 # -----------------------------
